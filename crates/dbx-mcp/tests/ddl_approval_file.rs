@@ -139,7 +139,12 @@ async fn out_of_band_approval_gates_ddl_on_the_dedicated_connection() {
     let prepared = call(
         &client,
         "dbx_prepare_ddl",
-        json!({ "connection_name": "staging-ddl", "database": "main", "sql": "CREATE TABLE approved_proof (id INTEGER)" }),
+        json!({
+            "connection_name": "staging-ddl",
+            "database": "main",
+            "sql": "CREATE TABLE approved_proof (id INTEGER)",
+            "notify_thread_id": "4242",
+        }),
     )
     .await;
     assert_ne!(prepared.is_error, Some(true), "prepare failed: {}", text_of(&prepared));
@@ -155,6 +160,7 @@ async fn out_of_band_approval_gates_ddl_on_the_dedicated_connection() {
     assert_eq!(pending["sql"], "CREATE TABLE approved_proof (id INTEGER)");
     assert_eq!(pending["digest"], digest.as_str());
     assert_eq!(pending["connection_id"], "staging-ddl");
+    assert_eq!(pending["notify_thread_id"], "4242", "host-supplied topic reaches the approver");
 
     // 4. Early apply is refused and does NOT burn the proposal.
     let early = call(&client, "dbx_apply_approved_ddl", json!({ "proposal_id": proposal_id })).await;

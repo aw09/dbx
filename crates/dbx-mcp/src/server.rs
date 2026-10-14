@@ -233,6 +233,11 @@ pub struct PrepareDdlRequest {
     pub database: Option<String>,
     #[schemars(description = "Exactly one DDL statement (CREATE/ALTER/DROP). Nothing is executed.")]
     pub sql: String,
+    /// Chat thread the approval request should be shown in. Set by the host (not the model), used
+    /// only for presentation by the out-of-band approver; it never affects what is approved.
+    #[serde(default)]
+    #[schemars(skip)]
+    pub notify_thread_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -3534,6 +3539,10 @@ impl DbxMcpServer {
             "sql": statement,
             "created_at_unix": now,
             "expires_at_unix": now + ttl,
+            "notify_thread_id": request
+                .notify_thread_id
+                .as_deref()
+                .filter(|id| !id.is_empty() && id.len() <= 12 && id.bytes().all(|b| b.is_ascii_digit())),
         });
         if let Err(error) = publish_pending(&config.approval_dir, &record) {
             return tool_error("DDL_APPROVAL_UNAVAILABLE", format!("Could not hand the proposal to the approver: {error}"));
@@ -5905,7 +5914,12 @@ mod tests {
     }
 
     fn ddl_prepare_request(sql: &str) -> PrepareDdlRequest {
-        PrepareDdlRequest { selector: selector("sqlite"), database: Some("staging".into()), sql: sql.to_string() }
+        PrepareDdlRequest {
+            selector: selector("sqlite"),
+            database: Some("staging".into()),
+            sql: sql.to_string(),
+            notify_thread_id: None,
+        }
     }
 
     fn proposal_id(result: &CallToolResult) -> String {
