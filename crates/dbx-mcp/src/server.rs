@@ -236,6 +236,21 @@ pub struct PrepareDdlRequest {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DdlInspectRequest {
+    #[serde(flatten)]
+    pub selector: ConnectionSelector,
+    #[schemars(description = "Database name (defaults to the connection's database)")]
+    #[schemars(extend("type" = "string"))]
+    pub database: Option<String>,
+    #[schemars(description = "Schema name, e.g. public")]
+    #[schemars(extend("type" = "string"))]
+    pub schema: Option<String>,
+    #[schemars(description = "Table name; when given, its columns are returned instead of the table list")]
+    #[schemars(extend("type" = "string"))]
+    pub table: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ApplyApprovedDdlRequest {
     #[schemars(
         description = "proposal_id returned by dbx_prepare_ddl. Executes the prepared statement ONLY if an external approver has approved its digest. Carries no SQL, no target and no approval token."
@@ -3352,6 +3367,48 @@ impl DbxMcpServer {
             approval.approver, proposal.digest, result.content
         ))
     }
+
+    #[tool(
+        name = "dbx_ddl_inspect",
+        description = "Read-only metadata for a DDL connection: lists tables (and views) in a schema, or the columns of one table when `table` is given. Use it to plan a DDL change and to verify the result after dbx_apply_approved_ddl. Runs no SQL you supply and changes nothing."
+    )]
+    async fn ddl_inspect(&self, Parameters(request): Parameters<DdlInspectRequest>) -> CallToolResult {
+        if let Err(error) = self.ensure_tool_allowed("dbx_ddl_inspect").await {
+            return error;
+        }
+        let Some(config) = self.ddl_config.clone() else {
+            return tool_error("DDL_NOT_CONFIGURED", "No DDL connection is configured for this DBX MCP server.");
+        };
+        let (connection, _) = match self.resolve_ddl_target(&config, &request.selector).await {
+            Ok(target) => target,
+            Err(error) => return error,
+        };
+        let database = request
+            .database
+            .map(|database| database.trim().to_string())
+            .filter(|database| !database.is_empty())
+            .or_else(|| connection.database.clone())
+            .unwrap_or_default();
+        let schema = request.schema.map(|schema| schema.trim().to_string()).unwrap_or_default();
+        match request.table.map(|table| table.trim().to_string()).filter(|table| !table.is_empty()) {
+            Some(table) => match self.backend.get_columns(&connection, &database, &schema, &table).await {
+                Ok(columns) if columns.is_empty() => text(format!("No table \"{table}\" (or no columns) in {database}.{schema}.")),
+                Ok(columns) => text(format_columns(&columns)),
+                Err(error) => tool_error("TABLE_DESCRIPTION_ERROR", error),
+            },
+            None => match self.backend.list_tables(&connection, &database, &schema).await {
+                Ok(tables) if tables.is_empty() => text("No tables found."),
+                Ok(tables) => text(
+                    tables
+                        .into_iter()
+                        .map(|table| format!("- {} ({})", table.name, table.table_type))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+                Err(error) => tool_error("TABLE_LIST_ERROR", error),
+            },
+        }
+    }
 }
 
 impl DbxMcpServer {
@@ -3364,14 +3421,44 @@ impl DbxMcpServer {
     async fn resolve_ddl_target(
         &self,
         config: &DdlPilotConfig,
+        selector: &ConnectionSelector,
     ) -> Result<(dbx_core::models::connection::ConnectionConfig, McpGlobalPolicy), CallToolResult> {
         let mut policy = self.load_policy().await?;
         let connections =
             self.backend.load_connections().await.map_err(|error| tool_error("CONNECTION_LOAD_ERROR", error))?;
-        let connection = connections
-            .into_iter()
-            .find(|connection| connection.id == config.connection_id)
-            .ok_or_else(|| tool_error("DDL_CONNECTION_NOT_FOUND", "The configured DDL connection was not found."))?;
+        // Only connections on the DDL allowlist are ever candidates; nothing the
+        // caller sends can widen this set.
+        let allowed: Vec<_> = connections.into_iter().filter(|connection| config.allows(&connection.id)).collect();
+        let names = || allowed.iter().map(|connection| format!("\"{}\" (id {})", connection.name, connection.id)).collect::<Vec<_>>().join(", ");
+        let wanted_id = selector.connection_id.as_deref().map(str::trim).filter(|value| !value.is_empty());
+        let wanted_name = selector.connection_name.as_deref().map(str::trim).filter(|value| !value.is_empty());
+        let matches: Vec<_> = allowed
+            .iter()
+            .filter(|connection| match (wanted_id, wanted_name) {
+                (Some(id), _) => connection.id == id,
+                (None, Some(name)) => connection.name.eq_ignore_ascii_case(name) || connection.id == name,
+                (None, None) => true,
+            })
+            .cloned()
+            .collect();
+        let connection = match matches.as_slice() {
+            [connection] => connection.clone(),
+            [] if allowed.is_empty() => {
+                return Err(tool_error("DDL_CONNECTION_NOT_FOUND", "No configured DDL connection exists in DBX storage."))
+            }
+            [] => {
+                return Err(tool_error(
+                    "DDL_CONNECTION_NOT_ALLOWED",
+                    format!("That connection is not enabled for approved DDL. DDL connections: {}.", names()),
+                ))
+            }
+            _ => {
+                return Err(tool_error(
+                    "DDL_CONNECTION_REQUIRED",
+                    format!("Several DDL connections are enabled; pass connection_name or connection_id. DDL connections: {}.", names()),
+                ))
+            }
+        };
         policy.read_only = false;
         policy.allow_dangerous_sql = true;
         policy.prompt_high_risk_sql = false;
@@ -3387,11 +3474,10 @@ impl DbxMcpServer {
         proposal: &DdlProposal,
     ) -> Result<(dbx_core::models::connection::ConnectionConfig, McpGlobalPolicy), CallToolResult> {
         if let Some(config) = self.ddl_config.clone() {
-            let (connection, policy) = self.resolve_ddl_target(&config).await?;
-            if connection.id != proposal.connection_id {
-                return Err(tool_error("DDL_PROPOSAL_INVALID", "The DDL connection changed after this proposal was prepared."));
-            }
-            return Ok((connection, policy));
+            // Re-resolved by id against the current allowlist: a connection removed
+            // from DBX_DDL_CONNECTION_IDS while the approval was pending fails here.
+            let selector = ConnectionSelector { connection_id: Some(proposal.connection_id.clone()), connection_name: None };
+            return self.resolve_ddl_target(&config, &selector).await;
         }
         let resolved = self
             .resolve_connection(&ConnectionSelector { connection_id: Some(proposal.connection_id.clone()), connection_name: None })
@@ -3408,7 +3494,7 @@ impl DbxMcpServer {
     }
 
     async fn prepare_ddl_out_of_band(&self, config: &DdlPilotConfig, request: PrepareDdlRequest) -> CallToolResult {
-        let (connection, policy) = match self.resolve_ddl_target(config).await {
+        let (connection, policy) = match self.resolve_ddl_target(config, &request.selector).await {
             Ok(target) => target,
             Err(error) => return error,
         };
@@ -6972,9 +7058,9 @@ mod tests {
         let tools = server.tool_router.list_all();
         let names = tools.iter().map(|tool| tool.name.as_ref()).collect::<Vec<_>>();
         #[cfg(feature = "mq-admin")]
-        assert_eq!(tools.len(), 27);
+        assert_eq!(tools.len(), 28);
         #[cfg(not(feature = "mq-admin"))]
-        assert_eq!(tools.len(), 25);
+        assert_eq!(tools.len(), 26);
         #[cfg(feature = "mq-admin")]
         assert!(names.contains(&"dbx_peek_messages"));
         #[cfg(not(feature = "mq-admin"))]
@@ -7246,9 +7332,9 @@ mod tests {
         );
         let names = server.tool_router.list_all().into_iter().map(|tool| tool.name).collect::<Vec<_>>();
         #[cfg(feature = "mq-admin")]
-        assert_eq!(names.len(), 22);
+        assert_eq!(names.len(), 23);
         #[cfg(not(feature = "mq-admin"))]
-        assert_eq!(names.len(), 20);
+        assert_eq!(names.len(), 21);
         assert!(!names.iter().any(|name| name == "dbx_add_connection"));
         assert!(!names.iter().any(|name| name == "dbx_duplicate_connection"));
         assert!(!names.iter().any(|name| name == "dbx_remove_connection"));

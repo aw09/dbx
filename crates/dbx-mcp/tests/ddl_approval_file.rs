@@ -89,7 +89,7 @@ async fn out_of_band_approval_gates_ddl_on_the_dedicated_connection() {
 
     let storage = Storage::open(&db_path).await.expect("open storage");
     storage
-        .save_connections(&[sqlite_connection("staging-ro", &sqlite_path), sqlite_connection("staging-ddl", &sqlite_path)])
+        .save_connections(&[sqlite_connection("staging-ro", &sqlite_path), sqlite_connection("staging-ddl", &sqlite_path), sqlite_connection("staging-ddl2", &sqlite_path)])
         .await
         .expect("save connections");
     // The stored policy is what every generic tool sees: read-only.
@@ -99,7 +99,7 @@ async fn out_of_band_approval_gates_ddl_on_the_dedicated_connection() {
         .expect("save policy");
     drop(storage);
 
-    std::env::set_var("DBX_DDL_CONNECTION_ID", "staging-ddl");
+    std::env::set_var("DBX_DDL_CONNECTION_IDS", "staging-ddl, staging-ddl2");
     std::env::set_var("DBX_DDL_APPROVAL_DIR", &approval_dir);
     let backend = Arc::new(LocalBackend::open(&db_path).await.expect("open local backend"));
     let server = DbxMcpServer::with_runtime_options(backend, McpScope::default(), false);
@@ -119,11 +119,27 @@ async fn out_of_band_approval_gates_ddl_on_the_dedicated_connection() {
     }
     assert!(!table_exists(&client, "bypass").await);
 
-    // 2. Prepare ignores the caller's selector, executes nothing, publishes pending.
+    // 2. Only allowlisted connections are DDL targets; with several, one must be named.
+    let not_allowed = call(
+        &client,
+        "dbx_prepare_ddl",
+        json!({ "connection_id": "staging-ro", "database": "main", "sql": "CREATE TABLE nope (id INTEGER)" }),
+    )
+    .await;
+    assert_eq!(not_allowed.is_error, Some(true));
+    assert!(text_of(&not_allowed).contains("DDL_CONNECTION_NOT_ALLOWED"), "{}", text_of(&not_allowed));
+    let ambiguous = call(&client, "dbx_prepare_ddl", json!({ "database": "main", "sql": "CREATE TABLE nope (id INTEGER)" })).await;
+    assert_eq!(ambiguous.is_error, Some(true));
+    assert!(text_of(&ambiguous).contains("DDL_CONNECTION_REQUIRED"), "{}", text_of(&ambiguous));
+    let inspect_ro = call(&client, "dbx_ddl_inspect", json!({ "connection_id": "staging-ro" })).await;
+    assert_eq!(inspect_ro.is_error, Some(true), "inspect must stay on DDL connections");
+    assert!(!table_exists(&client, "nope").await);
+
+    // 3. Prepare on a named DDL connection executes nothing and publishes pending.
     let prepared = call(
         &client,
         "dbx_prepare_ddl",
-        json!({ "connection_id": "staging-ro", "database": "main", "sql": "CREATE TABLE approved_proof (id INTEGER)" }),
+        json!({ "connection_name": "staging-ddl", "database": "main", "sql": "CREATE TABLE approved_proof (id INTEGER)" }),
     )
     .await;
     assert_ne!(prepared.is_error, Some(true), "prepare failed: {}", text_of(&prepared));
@@ -140,18 +156,18 @@ async fn out_of_band_approval_gates_ddl_on_the_dedicated_connection() {
     assert_eq!(pending["digest"], digest.as_str());
     assert_eq!(pending["connection_id"], "staging-ddl");
 
-    // 3. Early apply is refused and does NOT burn the proposal.
+    // 4. Early apply is refused and does NOT burn the proposal.
     let early = call(&client, "dbx_apply_approved_ddl", json!({ "proposal_id": proposal_id })).await;
     assert_eq!(early.is_error, Some(true));
     assert!(text_of(&early).contains("DDL_NOT_APPROVED") || text_of(&early).contains("not been approved"), "{}", text_of(&early));
 
-    // 4. A record whose content names another digest is not an approval.
+    // 5. A record whose content names another digest is not an approval.
     write_approval(&approval_dir, &digest, &"0".repeat(64));
     let forged = call(&client, "dbx_apply_approved_ddl", json!({ "proposal_id": proposal_id })).await;
     assert_eq!(forged.is_error, Some(true), "mismatched approval must be rejected");
     assert!(!table_exists(&client, "approved_proof").await);
 
-    // 5. The real approval executes exactly once and is spent.
+    // 6. The real approval executes exactly once and is spent.
     write_approval(&approval_dir, &digest, &digest);
     let applied = call(&client, "dbx_apply_approved_ddl", json!({ "proposal_id": proposal_id })).await;
     assert_ne!(applied.is_error, Some(true), "approved apply failed: {}", text_of(&applied));
@@ -161,6 +177,14 @@ async fn out_of_band_approval_gates_ddl_on_the_dedicated_connection() {
 
     let replay = call(&client, "dbx_apply_approved_ddl", json!({ "proposal_id": proposal_id })).await;
     assert_eq!(replay.is_error, Some(true), "a proposal is single-use");
+
+    // 7. Read-only readback on the DDL connection: tables, then columns.
+    let tables = call(&client, "dbx_ddl_inspect", json!({ "connection_id": "staging-ddl" })).await;
+    assert_ne!(tables.is_error, Some(true), "inspect failed: {}", text_of(&tables));
+    assert!(text_of(&tables).contains("approved_proof"), "{}", text_of(&tables));
+    let columns = call(&client, "dbx_ddl_inspect", json!({ "connection_id": "staging-ddl2", "table": "approved_proof" })).await;
+    assert_ne!(columns.is_error, Some(true), "inspect columns failed: {}", text_of(&columns));
+    assert!(text_of(&columns).contains("id"), "{}", text_of(&columns));
 
     client.cancel().await.expect("close client");
     server_task.abort();

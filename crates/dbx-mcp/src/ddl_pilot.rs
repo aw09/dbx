@@ -150,24 +150,37 @@ impl PendingDdlProposals {
 /// privileged MCP process. Both variables are required; with either missing the
 /// pilot stays deny-all.
 ///
-/// * `DBX_DDL_CONNECTION_ID` — the connection (a DDL-capable DB account) the DDL
-///   tools execute against. It is deliberately *not* part of the MCP connection
-///   scope, so the generic query tools cannot resolve or list it.
+/// * `DBX_DDL_CONNECTION_IDS` — comma-separated connections (DDL-capable DB
+///   accounts) the DDL tools may execute against. The single-value
+///   `DBX_DDL_CONNECTION_ID` is still read and merged in. These connections are
+///   deliberately *not* part of the MCP connection scope, so the generic query
+///   tools cannot resolve or list them.
 /// * `DBX_DDL_APPROVAL_DIR` — directory shared with the out-of-band approver,
 ///   writable only by the service account. `pending/` receives proposals from
 ///   this process; `approved/` receives decisions from the approver; spent
 ///   approvals move to `used/`.
 #[derive(Debug, Clone)]
 pub struct DdlPilotConfig {
-    pub connection_id: String,
+    pub connection_ids: Vec<String>,
     pub approval_dir: PathBuf,
 }
 
 impl DdlPilotConfig {
     pub fn from_env() -> Option<Self> {
-        let connection_id = std::env::var("DBX_DDL_CONNECTION_ID").ok()?.trim().to_string();
+        let mut connection_ids = Vec::new();
+        for name in ["DBX_DDL_CONNECTION_IDS", "DBX_DDL_CONNECTION_ID"] {
+            for id in std::env::var(name).unwrap_or_default().split(',').map(str::trim).filter(|id| !id.is_empty()) {
+                if !connection_ids.iter().any(|known| known == id) {
+                    connection_ids.push(id.to_string());
+                }
+            }
+        }
         let approval_dir = std::env::var_os("DBX_DDL_APPROVAL_DIR").filter(|value| !value.is_empty())?;
-        (!connection_id.is_empty()).then(|| Self { connection_id, approval_dir: PathBuf::from(approval_dir) })
+        (!connection_ids.is_empty()).then(|| Self { connection_ids, approval_dir: PathBuf::from(approval_dir) })
+    }
+
+    pub fn allows(&self, connection_id: &str) -> bool {
+        self.connection_ids.iter().any(|id| id == connection_id)
     }
 }
 
