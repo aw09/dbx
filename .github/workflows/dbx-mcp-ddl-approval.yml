@@ -1,0 +1,53 @@
+name: dbx-mcp (ddl-approval)
+
+# Fork-only build of the dbx-mcp binary with out-of-band DDL approval.
+# Produces a linux/amd64 binary, its sha256, and a build provenance attestation.
+on:
+  push:
+    branches: [ddl-approval]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: dbx-mcp-ddl-approval-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@v5
+      - name: System packages
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq cmake pkg-config libfontconfig-dev libfreetype-dev
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: dbx-mcp
+      - name: Test DDL approval
+        run: cargo test -p dbx-mcp --no-default-features --features sqlite-bundled --lib --test protocol --test ddl_approval_file --test ddl_pilot
+      - name: Build release
+        run: cargo build --release --locked -p dbx-mcp
+      - name: Package
+        run: |
+          mkdir dist
+          cp target/release/dbx-mcp dist/dbx-mcp
+          strip dist/dbx-mcp
+          (cd dist && sha256sum dbx-mcp > dbx-mcp.sha256 && cat dbx-mcp.sha256)
+          ldd dist/dbx-mcp || true
+      - uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: dist/dbx-mcp
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dbx-mcp-linux-amd64
+          path: dist/
+          retention-days: 30
