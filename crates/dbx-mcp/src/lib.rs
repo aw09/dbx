@@ -1,6 +1,7 @@
 #![recursion_limit = "256"]
 
 pub mod backend;
+pub mod ddl_pilot;
 pub mod diagnostics;
 pub mod http;
 pub mod http_auth;

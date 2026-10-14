@@ -15,6 +15,9 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::backend::{format_query_result, new_connection_config, parse_database_type, ConnectionSummary, DbxBackend};
+use crate::ddl_pilot::{ddl_digest, single_statement_ddl, DdlApprover, DenyAllApprover, PendingDdlProposals, DdlProposal, DDL_PROPOSAL_TTL};
+#[cfg(test)]
+use crate::ddl_pilot::DdlApproval;
 use crate::mongo::{self, MongoCommand, MongoSafetyError};
 use crate::session::{McpSession, McpSessionStore};
 use crate::transaction::{TransactionFailure, TransactionResult, TransactionStatus};
@@ -216,6 +219,25 @@ pub struct CloseSessionRequest {
 pub struct TransactionSessionRequest {
     #[schemars(description = "Transaction-enabled session ID returned by dbx_open_session")]
     pub session_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PrepareDdlRequest {
+    #[serde(flatten)]
+    pub selector: ConnectionSelector,
+    #[schemars(description = "Database name the DDL targets")]
+    #[schemars(extend("type" = "string"))]
+    pub database: Option<String>,
+    #[schemars(description = "Exactly one DDL statement (CREATE/ALTER/DROP). Nothing is executed.")]
+    pub sql: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ApplyApprovedDdlRequest {
+    #[schemars(
+        description = "proposal_id returned by dbx_prepare_ddl. Executes the prepared statement ONLY if an external approver has approved its digest. Carries no SQL, no target and no approval token."
+    )]
+    pub proposal_id: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -693,6 +715,12 @@ pub struct DbxMcpServer {
     plugin_tools_mode: PluginToolsMode,
     sessions: Arc<McpSessionStore>,
     pending_salesforce_writes: Arc<PendingSalesforceWrites>,
+    /// Prepared staging DDL proposals. The id is a lookup handle, never an
+    /// approval.
+    pending_ddl: Arc<PendingDdlProposals>,
+    /// The external authorization boundary. Defaults to deny-all so the DDL
+    /// tools execute nothing until a real approver is wired.
+    ddl_approver: Arc<dyn DdlApprover>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -925,7 +953,16 @@ impl DbxMcpServer {
             tool_router.disable_route("dbx_plugin_tools");
             tool_router.disable_route("dbx_plugin_call");
         }
-        Self { backend, scope, plugin_tools_mode, sessions, pending_salesforce_writes, tool_router }
+        Self { backend, scope, plugin_tools_mode, sessions, pending_salesforce_writes, pending_ddl: PendingDdlProposals::new(DDL_PROPOSAL_TTL), ddl_approver: Arc::new(DenyAllApprover), tool_router }
+    }
+
+    /// Wire the external DDL authorization boundary. Without this the DDL tools
+    /// stay deny-all. The approver must live outside the MCP client's trust
+    /// domain (a privileged service or a signed approval store), never inside
+    /// the agent that requests execution.
+    pub fn with_ddl_approver(mut self, approver: Arc<dyn DdlApprover>) -> Self {
+        self.ddl_approver = approver;
+        self
     }
 
     fn spawn_session_cleanup(&self, session: McpSession) -> tokio::sync::oneshot::Receiver<SessionCleanupResult> {
@@ -3147,6 +3184,148 @@ impl DbxMcpServer {
             return agent_result(result);
         }
         text(format!("Salesforce write applied: {label}.\n{}", result.content))
+    }
+
+    #[tool(
+        name = "dbx_prepare_ddl",
+        description = "Step 1 of 2 for a staging DDL change. Validates that the request is exactly ONE DDL statement against an allowed, non-production target, and returns a proposal_id plus a SHA-256 digest of the target+statement. Nothing is executed. Show the digest and statement to the approver; execution requires that an EXTERNAL approver (outside this MCP client) has approved the digest. This tool mints no approval and stores no token the caller can use to authorize execution. Call dbx_apply_approved_ddl with the proposal_id afterwards."
+    )]
+    async fn prepare_ddl(&self, Parameters(request): Parameters<PrepareDdlRequest>) -> CallToolResult {
+        if let Err(error) = self.ensure_tool_allowed("dbx_prepare_ddl").await {
+            return error;
+        }
+        let resolved = match self.resolve_connection(&request.selector).await {
+            Ok(resolved) => resolved,
+            Err(error) => return error,
+        };
+        let connection = &resolved.connection;
+        let database = match self.resolve_database(request.database, &resolved) {
+            Ok(database) => database,
+            Err(error) => return error,
+        };
+        if let Err(error) = ensure_sql_database_scope(&resolved.database_scope, connection, &database, &request.sql) {
+            return error;
+        }
+        let statement = match single_statement_ddl(&request.sql, connection.db_type) {
+            Ok(statement) => statement,
+            Err(error) => return tool_error("DDL_INVALID", error),
+        };
+        // Fail closed on production before handing out any handle. The same
+        // guard runs again at apply time; this only avoids preparing a proposal
+        // that could never execute.
+        if targets_production_database(connection, &database, &statement) {
+            return tool_error("PRODUCTION_WRITE_BLOCKED", "MCP cannot execute writes against a production database.");
+        }
+        let policy = effective_policy_for_database_with_groups(&resolved.policy, &resolved.group_ids, connection, &database);
+        if let Err(error) = validate_sql_policy(connection, &policy, &database, &statement, false) {
+            return error;
+        }
+        let proposal_id = format!("ddl-{}", Uuid::new_v4());
+        let digest = ddl_digest(&proposal_id, &connection.id, &database, &statement);
+        let expires_in_secs = self.pending_ddl.ttl_secs();
+        self.pending_ddl
+            .insert(
+                proposal_id.clone(),
+                DdlProposal {
+                    connection_id: connection.id.clone(),
+                    database: database.clone(),
+                    sql: statement.clone(),
+                    digest: digest.clone(),
+                    created_at: Instant::now(),
+                },
+            )
+            .await;
+        let mut result = text(format!(
+            "Prepared (nothing executed).\nStatement: {statement}\nTarget: connection \"{}\", database \"{database}\"\nDigest (SHA-256): {digest}\nproposal_id: {proposal_id}\nThis proposal is valid for {expires_in_secs} seconds and can be applied at most once, and only after an external approver approves the digest above. This MCP client cannot approve it.",
+            connection.name
+        ));
+        result.structured_content = Some(json!({
+            "proposal_id": proposal_id,
+            "digest": digest,
+            "statement": statement,
+            "connection_id": connection.id,
+            "database": database,
+            "expires_in_secs": expires_in_secs,
+        }));
+        result
+    }
+
+    #[tool(
+        name = "dbx_apply_approved_ddl",
+        description = "Step 2 of 2 for a staging DDL change: execute exactly the statement prepared by dbx_prepare_ddl, identified by its proposal_id. Takes NO sql, target or approval token. Executes only if an external approver has approved the proposal's digest and the proposal is unexpired and unclaimed; the production-write guard still applies. The proposal is single-use."
+    )]
+    async fn apply_approved_ddl(&self, Parameters(request): Parameters<ApplyApprovedDdlRequest>) -> CallToolResult {
+        if let Err(error) = self.ensure_tool_allowed("dbx_apply_approved_ddl").await {
+            return error;
+        }
+        let Some(proposal) = self.pending_ddl.take(&request.proposal_id).await else {
+            return tool_error(
+                "DDL_PROPOSAL_INVALID",
+                format!(
+                    "No pending DDL proposal for proposal_id \"{}\". Proposals are single-use and expire after {} seconds; call dbx_prepare_ddl again.",
+                    request.proposal_id.trim(),
+                    self.pending_ddl.ttl_secs()
+                ),
+            );
+        };
+        // The approval lives entirely outside this process. The agent holds the
+        // proposal id, never an approval, so it cannot authorize its own write.
+        let Some(approval) = self.ddl_approver.approval_for(&proposal.digest).await else {
+            return tool_error(
+                "DDL_NOT_APPROVED",
+                "This DDL proposal has not been approved by the external approver. Nothing was executed.",
+            );
+        };
+        // Re-read the connection and policy at apply time: the user may have
+        // narrowed scope or withdrawn permissions while the approval was pending.
+        let resolved = match self
+            .resolve_connection(&ConnectionSelector {
+                connection_id: Some(proposal.connection_id.clone()),
+                connection_name: None,
+            })
+            .await
+        {
+            Ok(resolved) => resolved,
+            Err(error) => return error,
+        };
+        let connection = &resolved.connection;
+        if let Err(error) = self.resolve_database(Some(proposal.database.clone()), &resolved) {
+            return error;
+        }
+        let policy = effective_policy_for_database_with_groups(&resolved.policy, &resolved.group_ids, connection, &proposal.database);
+        let permissions = match validate_sql_policy(connection, &policy, &proposal.database, &proposal.sql, false) {
+            Ok(permissions) => permissions,
+            Err(error) => return error,
+        };
+        let mut arguments = json!({ "sql": proposal.sql, "limit": 1 });
+        if let Some(secs) = resolved.policy.query_timeout_secs {
+            arguments["timeout_secs"] = json!(secs);
+        }
+        let started_at = Instant::now();
+        let result = self
+            .backend
+            .execute_agent_tool(connection, &proposal.database, "execute_query", arguments, permissions)
+            .await;
+        let success = !result.is_error;
+        let error = result.is_error.then(|| result.content.trim_start_matches("Error: ").to_string());
+        self.save_mcp_sql_history(
+            "dbx_apply_approved_ddl",
+            connection,
+            &proposal.database,
+            &proposal.sql,
+            started_at,
+            success,
+            error,
+            None,
+        )
+        .await;
+        if !success {
+            return agent_result(result);
+        }
+        text(format!(
+            "DDL applied (approved by {}).\nDigest: {}\n{}",
+            approval.approver, proposal.digest, result.content
+        ))
     }
 }
 
@@ -5466,6 +5645,194 @@ mod tests {
         assert!(result_text(&error).contains("PRODUCTION_WRITE_BLOCKED"));
     }
 
+    /// An approver that approves exactly one digest, standing in for the
+    /// external authorization boundary in tests.
+    struct TestApprover {
+        digest: std::sync::Mutex<String>,
+        approver: String,
+    }
+
+    #[async_trait]
+    impl DdlApprover for TestApprover {
+        async fn approval_for(&self, digest: &str) -> Option<DdlApproval> {
+            (digest == *self.digest.lock().unwrap()).then(|| DdlApproval { approver: self.approver.clone() })
+        }
+    }
+
+    fn ddl_connection() -> ConnectionConfig {
+        connection("sqlite", "Staging", "sqlite", "staging")
+    }
+
+    fn ddl_server(backend: Arc<FakeBackend>, approver: Arc<dyn DdlApprover>) -> DbxMcpServer {
+        DbxMcpServer::with_runtime_options(backend, McpScope::default(), false).with_ddl_approver(approver)
+    }
+
+    fn ddl_prepare_request(sql: &str) -> PrepareDdlRequest {
+        PrepareDdlRequest { selector: selector("sqlite"), database: Some("staging".into()), sql: sql.to_string() }
+    }
+
+    fn proposal_id(result: &CallToolResult) -> String {
+        result
+            .structured_content
+            .as_ref()
+            .and_then(|value| value.get("proposal_id"))
+            .and_then(|value| value.as_str())
+            .expect("prepare returns a proposal_id")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn prepare_ddl_executes_nothing_and_returns_a_digest() {
+        let sql = "CREATE TABLE staging_t (id INT)";
+        let backend = Arc::new(FakeBackend {
+            connections: vec![ddl_connection()],
+            policy: McpGlobalPolicy { allow_dangerous_sql: true, ..Default::default() },
+            ..Default::default()
+        });
+        let server = ddl_server(backend.clone(), Arc::new(DenyAllApprover));
+        let result = server.prepare_ddl(Parameters(ddl_prepare_request(sql))).await;
+        assert!(!result.is_error.unwrap_or(false), "{}", result_text(&result));
+        let digest = result.structured_content.as_ref().unwrap()["digest"].as_str().unwrap();
+        assert_eq!(digest, ddl_digest(&proposal_id(&result), "sqlite", "staging", sql));
+        assert!(result_text(&result).contains(sql));
+        assert!(
+            backend.recorded_arguments.lock().unwrap().is_empty(),
+            "prepare must not touch the backend"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_ddl_rejects_non_ddl_and_multi_statement() {
+        let backend = Arc::new(FakeBackend {
+            connections: vec![ddl_connection()],
+            policy: McpGlobalPolicy { allow_dangerous_sql: true, ..Default::default() },
+            ..Default::default()
+        });
+        let server = ddl_server(backend, Arc::new(DenyAllApprover));
+        for sql in ["SELECT 1", "DELETE FROM t", "CREATE TABLE a (id INT); DROP TABLE b"] {
+            let result = server.prepare_ddl(Parameters(ddl_prepare_request(sql))).await;
+            assert!(result.is_error.unwrap_or(false), "expected rejection for {sql}");
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_without_external_approval_executes_nothing() {
+        let sql = "CREATE TABLE staging_t (id INT)";
+        let backend = Arc::new(FakeBackend {
+            connections: vec![ddl_connection()],
+            policy: McpGlobalPolicy { allow_dangerous_sql: true, ..Default::default() },
+            ..Default::default()
+        });
+        let server = ddl_server(backend.clone(), Arc::new(DenyAllApprover));
+        let prepared = server.prepare_ddl(Parameters(ddl_prepare_request(sql))).await;
+        let id = proposal_id(&prepared);
+
+        let applied =
+            server.apply_approved_ddl(Parameters(ApplyApprovedDdlRequest { proposal_id: id })).await;
+        assert!(applied.is_error.unwrap_or(false));
+        assert!(
+            backend.recorded_arguments.lock().unwrap().is_empty(),
+            "no approval means no backend call"
+        );
+    }
+
+    #[tokio::test]
+    async fn approved_apply_executes_the_prepared_statement_exactly_once() {
+        let sql = "CREATE TABLE staging_t (id INT)";
+        let backend = Arc::new(FakeBackend {
+            connections: vec![ddl_connection()],
+            policy: McpGlobalPolicy { allow_dangerous_sql: true, ..Default::default() },
+            ..Default::default()
+        });
+        let approver = Arc::new(TestApprover {
+            digest: std::sync::Mutex::new(String::new()),
+            approver: "agung".into(),
+        });
+        let server = ddl_server(backend.clone(), approver.clone());
+        let prepared = server.prepare_ddl(Parameters(ddl_prepare_request(sql))).await;
+        let id = proposal_id(&prepared);
+        *approver.digest.lock().unwrap() = prepared.structured_content.as_ref().unwrap()["digest"].as_str().unwrap().to_string();
+
+        let applied =
+            server.apply_approved_ddl(Parameters(ApplyApprovedDdlRequest { proposal_id: id.clone() })).await;
+        assert!(!applied.is_error.unwrap_or(false), "{}", result_text(&applied));
+        let recorded = backend.recorded_arguments.lock().unwrap();
+        let executed: Vec<_> = recorded.iter().filter(|(name, _)| name == "execute_query").collect();
+        assert_eq!(executed.len(), 1, "exactly one execution");
+        assert_eq!(executed[0].1["sql"], serde_json::json!(sql));
+        drop(recorded);
+
+        let replay =
+            server.apply_approved_ddl(Parameters(ApplyApprovedDdlRequest { proposal_id: id })).await;
+        assert!(replay.is_error.unwrap_or(false), "a proposal is single-use");
+        assert_eq!(
+            backend.recorded_arguments.lock().unwrap().iter().filter(|(name, _)| name == "execute_query").count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_for_a_different_digest_does_not_authorize_execution() {
+        let sql = "CREATE TABLE staging_t (id INT)";
+        let backend = Arc::new(FakeBackend {
+            connections: vec![ddl_connection()],
+            policy: McpGlobalPolicy { allow_dangerous_sql: true, ..Default::default() },
+            ..Default::default()
+        });
+        let approver = Arc::new(TestApprover {
+            digest: std::sync::Mutex::new("wrong-digest".into()),
+            approver: "agung".into(),
+        });
+        let server = ddl_server(backend.clone(), approver);
+        let prepared = server.prepare_ddl(Parameters(ddl_prepare_request(sql))).await;
+        let id = proposal_id(&prepared);
+
+        let applied = server.apply_approved_ddl(Parameters(ApplyApprovedDdlRequest { proposal_id: id })).await;
+        assert!(applied.is_error.unwrap_or(false));
+        assert!(backend.recorded_arguments.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn approval_for_one_proposal_cannot_authorize_a_second_identical_proposal() {
+        let sql = "CREATE TABLE staging_t (id INT)";
+        let backend = Arc::new(FakeBackend {
+            connections: vec![ddl_connection()],
+            policy: McpGlobalPolicy { allow_dangerous_sql: true, ..Default::default() },
+            ..Default::default()
+        });
+        let first_server = ddl_server(backend.clone(), Arc::new(DenyAllApprover));
+        let first = first_server.prepare_ddl(Parameters(ddl_prepare_request(sql))).await;
+        let first_digest = first.structured_content.as_ref().unwrap()["digest"].as_str().unwrap().to_string();
+        let server = ddl_server(backend.clone(), Arc::new(TestApprover {
+            digest: std::sync::Mutex::new(first_digest.clone()), approver: "agung".into(),
+        }));
+        let second = server.prepare_ddl(Parameters(ddl_prepare_request(sql))).await;
+        let second_digest = second.structured_content.as_ref().unwrap()["digest"].as_str().unwrap();
+        assert_ne!(first_digest, second_digest, "approval must bind to the proposal, not just SQL and target");
+        let result = server.apply_approved_ddl(Parameters(ApplyApprovedDdlRequest { proposal_id: proposal_id(&second) })).await;
+        assert!(result.is_error.unwrap_or(false));
+        assert!(backend.recorded_arguments.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn approved_apply_still_cannot_write_to_production() {
+        let sql = "CREATE TABLE prod_t (id INT)";
+        let mut production = ddl_connection();
+        production.is_production = true;
+        let backend = Arc::new(FakeBackend {
+            connections: vec![production.clone()],
+            policy: McpGlobalPolicy { allow_dangerous_sql: true, ..Default::default() },
+            ..Default::default()
+        });
+        // Even an approver that approves everything cannot lift the production block.
+        let approver = Arc::new(TestApprover { digest: std::sync::Mutex::new(String::new()), approver: "agung".into() });
+        let server = ddl_server(backend.clone(), approver);
+        // prepare refuses a production target outright.
+        let prepared = server.prepare_ddl(Parameters(ddl_prepare_request(sql))).await;
+        assert!(prepared.is_error.unwrap_or(false), "production prepare must fail closed");
+        assert!(backend.recorded_arguments.lock().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn high_risk_sql_tools_require_and_consume_desktop_approval() {
         let query_sql = "CREATE TABLE approved_query (id INT)";
@@ -6454,9 +6821,9 @@ mod tests {
         let tools = server.tool_router.list_all();
         let names = tools.iter().map(|tool| tool.name.as_ref()).collect::<Vec<_>>();
         #[cfg(feature = "mq-admin")]
-        assert_eq!(tools.len(), 25);
+        assert_eq!(tools.len(), 27);
         #[cfg(not(feature = "mq-admin"))]
-        assert_eq!(tools.len(), 23);
+        assert_eq!(tools.len(), 25);
         #[cfg(feature = "mq-admin")]
         assert!(names.contains(&"dbx_peek_messages"));
         #[cfg(not(feature = "mq-admin"))]
@@ -6469,6 +6836,8 @@ mod tests {
         assert!(names.contains(&"dbx_get_routine_source"));
         assert!(names.contains(&"dbx_execute_query"));
         assert!(names.contains(&"dbx_execute_batch"));
+        assert!(names.contains(&"dbx_prepare_ddl"));
+        assert!(names.contains(&"dbx_apply_approved_ddl"));
         assert!(names.contains(&"dbx_begin_transaction"));
         assert!(names.contains(&"dbx_commit_transaction"));
         assert!(names.contains(&"dbx_rollback_transaction"));
@@ -6726,15 +7095,17 @@ mod tests {
         );
         let names = server.tool_router.list_all().into_iter().map(|tool| tool.name).collect::<Vec<_>>();
         #[cfg(feature = "mq-admin")]
-        assert_eq!(names.len(), 20);
+        assert_eq!(names.len(), 22);
         #[cfg(not(feature = "mq-admin"))]
-        assert_eq!(names.len(), 18);
+        assert_eq!(names.len(), 20);
         assert!(!names.iter().any(|name| name == "dbx_add_connection"));
         assert!(!names.iter().any(|name| name == "dbx_duplicate_connection"));
         assert!(!names.iter().any(|name| name == "dbx_remove_connection"));
         assert!(!names.iter().any(|name| name == "dbx_open_table"));
         assert!(!names.iter().any(|name| name == "dbx_execute_and_show"));
         assert!(names.iter().any(|name| name == "dbx_execute_batch"));
+        assert!(names.iter().any(|name| name == "dbx_prepare_ddl"));
+        assert!(names.iter().any(|name| name == "dbx_apply_approved_ddl"));
         assert!(names.iter().any(|name| name == "dbx_list_routines"));
         assert!(names.iter().any(|name| name == "dbx_get_routine_source"));
         assert!(names.iter().any(|name| name == "dbx_open_session"));
