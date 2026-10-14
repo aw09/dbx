@@ -15,7 +15,10 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::backend::{format_query_result, new_connection_config, parse_database_type, ConnectionSummary, DbxBackend};
-use crate::ddl_pilot::{ddl_digest, single_statement_ddl, DdlApprover, DenyAllApprover, PendingDdlProposals, DdlProposal, DDL_PROPOSAL_TTL};
+use crate::ddl_pilot::{
+    ddl_digest, publish_pending, single_statement_ddl, DdlApprover, DdlPilotConfig, DdlProposal, DenyAllApprover,
+    FileDdlApprover, PendingDdlProposals, DDL_PROPOSAL_TTL,
+};
 #[cfg(test)]
 use crate::ddl_pilot::DdlApproval;
 use crate::mongo::{self, MongoCommand, MongoSafetyError};
@@ -721,6 +724,9 @@ pub struct DbxMcpServer {
     /// The external authorization boundary. Defaults to deny-all so the DDL
     /// tools execute nothing until a real approver is wired.
     ddl_approver: Arc<dyn DdlApprover>,
+    /// Out-of-band approval wiring (`DBX_DDL_*`). When set, the DDL tools run
+    /// only against the configured DDL connection, outside the generic scope.
+    ddl_config: Option<Arc<DdlPilotConfig>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -953,7 +959,22 @@ impl DbxMcpServer {
             tool_router.disable_route("dbx_plugin_tools");
             tool_router.disable_route("dbx_plugin_call");
         }
-        Self { backend, scope, plugin_tools_mode, sessions, pending_salesforce_writes, pending_ddl: PendingDdlProposals::new(DDL_PROPOSAL_TTL), ddl_approver: Arc::new(DenyAllApprover), tool_router }
+        let ddl_config = DdlPilotConfig::from_env().map(Arc::new);
+        let ddl_approver: Arc<dyn DdlApprover> = match &ddl_config {
+            Some(config) => Arc::new(FileDdlApprover::new(config.approval_dir.clone(), DDL_PROPOSAL_TTL)),
+            None => Arc::new(DenyAllApprover),
+        };
+        Self {
+            backend,
+            scope,
+            plugin_tools_mode,
+            sessions,
+            pending_salesforce_writes,
+            pending_ddl: PendingDdlProposals::shared(),
+            ddl_approver,
+            ddl_config,
+            tool_router,
+        }
     }
 
     /// Wire the external DDL authorization boundary. Without this the DDL tools
@@ -3194,6 +3215,9 @@ impl DbxMcpServer {
         if let Err(error) = self.ensure_tool_allowed("dbx_prepare_ddl").await {
             return error;
         }
+        if let Some(config) = self.ddl_config.clone() {
+            return self.prepare_ddl_out_of_band(&config, request).await;
+        }
         let resolved = match self.resolve_connection(&request.selector).await {
             Ok(resolved) => resolved,
             Err(error) => return error,
@@ -3258,47 +3282,48 @@ impl DbxMcpServer {
         if let Err(error) = self.ensure_tool_allowed("dbx_apply_approved_ddl").await {
             return error;
         }
-        let Some(proposal) = self.pending_ddl.take(&request.proposal_id).await else {
-            return tool_error(
+        let invalid = || {
+            tool_error(
                 "DDL_PROPOSAL_INVALID",
                 format!(
                     "No pending DDL proposal for proposal_id \"{}\". Proposals are single-use and expire after {} seconds; call dbx_prepare_ddl again.",
                     request.proposal_id.trim(),
                     self.pending_ddl.ttl_secs()
                 ),
-            );
+            )
+        };
+        // Check the approval against a peeked copy first. An apply that arrives
+        // before the human approved must leave the proposal pending, otherwise the
+        // approval the human gives a moment later would point at nothing.
+        let Some(peeked) = self.pending_ddl.peek(&request.proposal_id).await else {
+            return invalid();
         };
         // The approval lives entirely outside this process. The agent holds the
         // proposal id, never an approval, so it cannot authorize its own write.
-        let Some(approval) = self.ddl_approver.approval_for(&proposal.digest).await else {
+        let Some(approval) = self.ddl_approver.approval_for(&peeked.digest).await else {
             return tool_error(
                 "DDL_NOT_APPROVED",
-                "This DDL proposal has not been approved by the external approver. Nothing was executed.",
+                "This DDL proposal has not been approved by the external approver yet. Nothing was executed and the proposal is still pending: ask the human to approve it, then call dbx_apply_approved_ddl again.",
             );
         };
+        // Claim it. Concurrent applies race here and at most one wins.
+        let Some(proposal) = self.pending_ddl.take(&request.proposal_id).await else {
+            return invalid();
+        };
+        self.ddl_approver.consume(&proposal.digest).await;
         // Re-read the connection and policy at apply time: the user may have
         // narrowed scope or withdrawn permissions while the approval was pending.
-        let resolved = match self
-            .resolve_connection(&ConnectionSelector {
-                connection_id: Some(proposal.connection_id.clone()),
-                connection_name: None,
-            })
-            .await
-        {
-            Ok(resolved) => resolved,
+        let (connection, policy) = match self.ddl_target_for_apply(&proposal).await {
+            Ok(target) => target,
             Err(error) => return error,
         };
-        let connection = &resolved.connection;
-        if let Err(error) = self.resolve_database(Some(proposal.database.clone()), &resolved) {
-            return error;
-        }
-        let policy = effective_policy_for_database_with_groups(&resolved.policy, &resolved.group_ids, connection, &proposal.database);
+        let connection = &connection;
         let permissions = match validate_sql_policy(connection, &policy, &proposal.database, &proposal.sql, false) {
             Ok(permissions) => permissions,
             Err(error) => return error,
         };
         let mut arguments = json!({ "sql": proposal.sql, "limit": 1 });
-        if let Some(secs) = resolved.policy.query_timeout_secs {
+        if let Some(secs) = policy.query_timeout_secs {
             arguments["timeout_secs"] = json!(secs);
         }
         let started_at = Instant::now();
@@ -3326,6 +3351,132 @@ impl DbxMcpServer {
             "DDL applied (approved by {}).\nDigest: {}\n{}",
             approval.approver, proposal.digest, result.content
         ))
+    }
+}
+
+impl DbxMcpServer {
+    /// The DDL connection and the only policy under which DDL may run: write
+    /// enabled, high-risk allowed, nothing else relaxed. This connection is not
+    /// resolved through the generic scope, so no other tool can reach it, and
+    /// `validate_sql_policy` still rejects production targets.
+    // CallToolResult is the rmcp wire response type; keeping it unboxed avoids conversions at every tool boundary.
+    #[allow(clippy::result_large_err)]
+    async fn resolve_ddl_target(
+        &self,
+        config: &DdlPilotConfig,
+    ) -> Result<(dbx_core::models::connection::ConnectionConfig, McpGlobalPolicy), CallToolResult> {
+        let mut policy = self.load_policy().await?;
+        let connections =
+            self.backend.load_connections().await.map_err(|error| tool_error("CONNECTION_LOAD_ERROR", error))?;
+        let connection = connections
+            .into_iter()
+            .find(|connection| connection.id == config.connection_id)
+            .ok_or_else(|| tool_error("DDL_CONNECTION_NOT_FOUND", "The configured DDL connection was not found."))?;
+        policy.read_only = false;
+        policy.allow_dangerous_sql = true;
+        policy.prompt_high_risk_sql = false;
+        policy.connection_policies.clear();
+        policy.group_policies.clear();
+        Ok((connection, policy))
+    }
+
+    // CallToolResult is the rmcp wire response type; keeping it unboxed avoids conversions at every tool boundary.
+    #[allow(clippy::result_large_err)]
+    async fn ddl_target_for_apply(
+        &self,
+        proposal: &DdlProposal,
+    ) -> Result<(dbx_core::models::connection::ConnectionConfig, McpGlobalPolicy), CallToolResult> {
+        if let Some(config) = self.ddl_config.clone() {
+            let (connection, policy) = self.resolve_ddl_target(&config).await?;
+            if connection.id != proposal.connection_id {
+                return Err(tool_error("DDL_PROPOSAL_INVALID", "The DDL connection changed after this proposal was prepared."));
+            }
+            return Ok((connection, policy));
+        }
+        let resolved = self
+            .resolve_connection(&ConnectionSelector { connection_id: Some(proposal.connection_id.clone()), connection_name: None })
+            .await?;
+        self.resolve_database(Some(proposal.database.clone()), &resolved)?;
+        ensure_sql_database_scope(&resolved.database_scope, &resolved.connection, &proposal.database, &proposal.sql)?;
+        let policy = effective_policy_for_database_with_groups(
+            &resolved.policy,
+            &resolved.group_ids,
+            &resolved.connection,
+            &proposal.database,
+        );
+        Ok((resolved.connection, policy))
+    }
+
+    async fn prepare_ddl_out_of_band(&self, config: &DdlPilotConfig, request: PrepareDdlRequest) -> CallToolResult {
+        let (connection, policy) = match self.resolve_ddl_target(config).await {
+            Ok(target) => target,
+            Err(error) => return error,
+        };
+        let database = request
+            .database
+            .map(|database| database.trim().to_string())
+            .filter(|database| !database.is_empty())
+            .or_else(|| connection.database.clone())
+            .unwrap_or_default();
+        if database.is_empty() {
+            return tool_error("DDL_INVALID", "A database is required for a DDL proposal.");
+        }
+        let statement = match single_statement_ddl(&request.sql, connection.db_type) {
+            Ok(statement) => statement,
+            Err(error) => return tool_error("DDL_INVALID", error),
+        };
+        if targets_production_database(&connection, &database, &statement) {
+            return tool_error("PRODUCTION_WRITE_BLOCKED", "MCP cannot execute writes against a production database.");
+        }
+        if let Err(error) = validate_sql_policy(&connection, &policy, &database, &statement, false) {
+            return error;
+        }
+        let proposal_id = format!("ddl-{}", Uuid::new_v4());
+        let digest = ddl_digest(&proposal_id, &connection.id, &database, &statement);
+        let ttl = self.pending_ddl.ttl_secs();
+        let now = crate::ddl_pilot::unix_now();
+        // Everything the approver shows comes from here, resolved by the server.
+        let record = json!({
+            "proposal_id": proposal_id,
+            "digest": digest,
+            "connection_id": connection.id,
+            "connection_name": connection.name,
+            "db_type": serde_json::to_value(connection.db_type).unwrap_or(serde_json::Value::Null),
+            "host": connection.host,
+            "port": connection.port,
+            "database": database,
+            "sql": statement,
+            "created_at_unix": now,
+            "expires_at_unix": now + ttl,
+        });
+        if let Err(error) = publish_pending(&config.approval_dir, &record) {
+            return tool_error("DDL_APPROVAL_UNAVAILABLE", format!("Could not hand the proposal to the approver: {error}"));
+        }
+        self.pending_ddl
+            .insert(
+                proposal_id.clone(),
+                DdlProposal {
+                    connection_id: connection.id.clone(),
+                    database: database.clone(),
+                    sql: statement.clone(),
+                    digest: digest.clone(),
+                    created_at: Instant::now(),
+                },
+            )
+            .await;
+        let mut result = text(format!(
+            "Prepared (nothing executed). The DBX approver has posted this proposal to Telegram with Approve/Reject buttons.\nStatement: {statement}\nTarget: connection \"{}\" ({}:{}), database \"{database}\"\nDigest (SHA-256): {digest}\nproposal_id: {proposal_id}\nValid for {ttl} seconds. Ask the human to press Approve on the DBX approver message (not on any message from you), then call dbx_apply_approved_ddl with this proposal_id. This MCP client cannot approve it.",
+            connection.name, connection.host, connection.port
+        ));
+        result.structured_content = Some(json!({
+            "proposal_id": proposal_id,
+            "digest": digest,
+            "statement": statement,
+            "connection_id": connection.id,
+            "database": database,
+            "expires_in_secs": ttl,
+        }));
+        result
     }
 }
 
